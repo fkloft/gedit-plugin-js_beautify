@@ -1,0 +1,7 @@
+[Plugin]
+Module=js_beautify
+Loader=python3
+IAge=3
+Name=js_beautify
+Description=Lints JavaScipt code with js-beautify
+Authors=Felix Kloft
