@@ -60,8 +60,8 @@ class GutterRenderer(GtkSource.GutterRenderer):
         edit_end = edit_start.copy()
         edit_end.forward_chars(len(removed) - len_prefix - len_suffix)
         
-        mark_start = self.view.buffer.create_mark("edit_start", edit_start, True)
-        mark_end = self.view.buffer.create_mark("edit_end", edit_end, False)
+        mark_start = self.view.buffer.create_mark(None, edit_start, True)
+        mark_end = self.view.buffer.create_mark(None, edit_end, False)
         
         self.view.buffer.begin_user_action()
         
