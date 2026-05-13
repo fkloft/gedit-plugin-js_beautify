@@ -77,6 +77,9 @@ class GutterRenderer(GtkSource.GutterRenderer):
         self.view.buffer.delete_mark(mark_end)
         
         self.view.buffer.end_user_action()
+        
+        self.view.context_data.remove(block)
+        self.update()
     
     def do_draw(self, cr, bg_area, cell_area, start, end, state):
         GtkSource.GutterRenderer.do_draw(self, cr, bg_area, cell_area, start, end, state)
@@ -159,5 +162,5 @@ class GutterRenderer(GtkSource.GutterRenderer):
         
         return result
     
-    def update(self):
+    def update(self) -> None:
         self.queue_draw()

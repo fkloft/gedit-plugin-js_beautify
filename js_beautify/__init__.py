@@ -3,8 +3,9 @@
 import gi
 import os.path
 import subprocess
+import threading
 import warnings
-from typing import Any, IO, List, Optional, cast
+from typing import Any, Callable, List, Optional, cast
 
 from . import diff
 from .gutterrenderer import GutterRenderer
@@ -23,11 +24,15 @@ class JSBeautifyViewActivatable(GObject.Object, Gedit.ViewActivatable):
         
         self.context_data: diff.Diff = []
         self.update_timeout = 0
-        self.parse_signal = 0
+        self.update_thread: Optional[threading.Thread] = None
+        self.active = False
+        self.dirty = False
         self.connected = False
         self.location: Optional[Gio.File] = None
     
     def do_activate(self) -> None:
+        self.active = True
+        self.dirty = True
         self.gutter_renderer = GutterRenderer(self)
         self.gutter = self.view.get_gutter(Gtk.TextWindowType.LEFT)
         
@@ -41,11 +46,12 @@ class JSBeautifyViewActivatable(GObject.Object, Gedit.ViewActivatable):
         self.on_notify_buffer(self.view)
     
     def do_deactivate(self) -> None:
+        self.active = False
+        self.dirty = False
         if self.update_timeout != 0:
             GLib.source_remove(self.update_timeout)
-        if self.parse_signal != 0:
-            GLib.source_remove(self.parse_signal)
-            self.parse_signal = 0
+        
+        self.cleanup_context_data()
         
         self.disconnect_buffer()
         self.buffer = None
@@ -66,12 +72,15 @@ class JSBeautifyViewActivatable(GObject.Object, Gedit.ViewActivatable):
     def disconnect_view(self) -> None:
         self.disconnect_signals(self.view, self.view_signals)
     
+    def cleanup_context_data(self) -> None:
+        "this could be used to remove marks from the active buffer if needed"
+        # for msg in self.context_data:
+        #     msg.cleanup()
+        self.context_data = []
+    
     def on_notify_buffer(self, view: Any, gspec: Any = None) -> None:
         if self.update_timeout != 0:
             GLib.source_remove(self.update_timeout)
-        if self.parse_signal != 0:
-            GLib.source_remove(self.parse_signal)
-            self.parse_signal = 0
         
         if self.buffer:
             self.disconnect_buffer()
@@ -134,21 +143,11 @@ class JSBeautifyViewActivatable(GObject.Object, Gedit.ViewActivatable):
         if not self.connected:
             return
         
-        # We don't let the delay accumulate
-        if self.update_timeout != 0:
+        if not self.buffer:
             return
-        if self.parse_signal != 0:
-            GLib.source_remove(self.parse_signal)
-            self.parse_signal = 0
         
-        # Do the initial diff without a delay
-        if not self.context_data:
-            self.on_update_timeout()
-        else:
-            n_lines: int = self.buffer.get_line_count()
-            delay = min(10000, 200 * (n_lines // 2000 + 1))
-            
-            self.update_timeout = GLib.timeout_add(delay, self.on_update_timeout)
+        self.dirty = True
+        self.update_timeout = GLib.timeout_add(1000, self.on_update_timeout)
     
     def find_user_config(self) -> Optional[str]:
         path = os.path.expanduser("~/.jsbeautifyrc")
@@ -176,81 +175,88 @@ class JSBeautifyViewActivatable(GObject.Object, Gedit.ViewActivatable):
     
     def on_update_timeout(self) -> None:
         self.update_timeout = 0
-        if self.parse_signal != 0:
-            GLib.source_remove(self.parse_signal)
-            self.parse_signal = 0
+        
+        if not (self.dirty and self.active):
+            return
         
         if not self.buffer:
-            self.context_data = []
+            self.cleanup_context_data()
+            return
+        
+        if self.update_thread:
             return
         
         text: str = self.buffer.get_text(self.buffer.get_start_iter(), self.buffer.get_end_iter(), True)
-        
-        args = ["js-beautify"]
-        
         config = self.find_config()
-        if config:
-            args.append("--config")
-            args.append(config)
-        
         if self.view.get_property("show-right-margin"):
-            pos = self.view.get_property("right-margin-position")
-            args.append("-w")
-            args.append(str(pos))
+            line_width = self.view.get_property("right-margin-position")
+        else:
+            line_width = None
         
         if self.location:
             cwd = cast(Gio.File, self.location.get_parent()).get_path()
         else:
             cwd = os.path.expanduser("~")
         
-        args.append("-")
+        self.dirty = False
+        args = (text, config, line_width, cwd, self.handle_result)
+        self.update_thread = threading.Thread(target=get_context_data, args=args)
+        self.update_thread.start()
+    
+    def handle_result(self, context_data: Optional[diff.Diff]) -> None:
+        self.update_thread = None
         
-        try:
-            proc = subprocess.Popen(
-                args,
-                cwd=cwd,
-                stdout=subprocess.PIPE,
-                stdin=subprocess.PIPE,
-                universal_newlines=True,
-            )
-        except FileNotFoundError as e:
-            warnings.warn("js-beautify could not be found in $PATH: " + str(e))
+        if not self.active:
             return
         
-        with cast(IO[str], proc.stdin) as stdin:
-            stdin.write(text)
-            stdin.close()
-        
-        data = ""
-        
-        def on_read(stdout: IO[str], flags: GLib.IOCondition, proc: subprocess.Popen) -> bool:
-            nonlocal data
-            
-            data += stdout.read(4096)
-            if not (flags & GLib.IO_HUP):
-                return True
-            
-            try:
-                returncode = proc.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                return True
-            
-            data += stdout.read()
-            
-            if returncode:
-                warnings.warn(f"js-beautify exited {returncode}")
-                self.parse_signal = 0
-                return False
-            
-            self.handle_result(text, data)
-            self.parse_signal = 0
-            return False
-        
-        self.parse_signal = GLib.io_add_watch(proc.stdout, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, on_read, proc)
-    
-    def handle_result(self, raw: str, formatted: str) -> None:
-        lines_a = raw.splitlines(keepends=True)
-        lines_b = formatted.splitlines(keepends=True)
-        context_data = diff.generate_diff(lines_a, lines_b)
-        self.context_data = context_data
+        self.cleanup_context_data()
+        if context_data:
+            self.context_data = context_data
         self.gutter_renderer.update()
+        
+        if self.dirty:
+            self.update_timeout = GLib.timeout_add(1000, self.on_update_timeout)
+
+
+def get_context_data(
+    text: str, config: Optional[str], line_width: Optional[int], cwd: str, callback: Callable[[diff.Diff], Any],
+) -> None:
+    "run in background thread"
+    
+    args = ["js-beautify"]
+    
+    if config:
+        args.append("--config")
+        args.append(config)
+    
+    if line_width is not None:
+        args.append("-w")
+        args.append(str(line_width))
+    
+    args.append("-")
+    
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=cwd,
+            input=text,
+            stdout=subprocess.PIPE,
+            universal_newlines=True,
+            check=True,
+        )
+    except FileNotFoundError as e:
+        warnings.warn("js-beautify could not be found in $PATH: " + str(e))
+        GLib.idle_add(callback, None)
+        return
+    except subprocess.CalledProcessError as e:
+        warnings.warn(f"js-beautify exited {e.returncode}")
+        GLib.idle_add(callback, None)
+        return
+    
+    formatted: str = proc.stdout
+    
+    lines_a = text.splitlines(keepends=True)
+    lines_b = formatted.splitlines(keepends=True)
+    context_data = diff.generate_diff(lines_a, lines_b)
+    
+    GLib.idle_add(callback, context_data)
